@@ -3,12 +3,19 @@ on:
   push:
     tags:
       - '*'
+  workflow_dispatch: {}
 
 jobs:
   release-helm-chart:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+    env:
+      CHART_PATH: imgproxy-helm/imgproxy
+      HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+      HARBOR_USER: ${{ secrets.HARBOR_USER }}
+      HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+      HARBOR_PROJECT: ${{ secrets.HARBOR_PROJECT }}
     steps:
       - name: Checkout the repository
         uses: actions/checkout@v4
@@ -18,24 +25,38 @@ jobs:
       - name: Setup Helm
         uses: azure/setup-helm@v3
 
-      - uses: actions/checkout@v4
-        with:
-          path: helm-repository/
-          ref: gh-pages
+      - name: Copy README into chart directory
+        run: cp imgproxy-helm/Readme.md $CHART_PATH/README.md
 
-      - run: cp imgproxy-helm/Readme.md imgproxy-helm/imgproxy/README.md
-
-      - name: Pack the current chart version
-        run: helm package -d helm-repository/ imgproxy-helm/imgproxy/
-
-      - name: Reindex Helm repository
-        run: helm repo index --url https://helm.imgproxy.net/ --merge helm-repository/index.yaml helm-repository/
-
-      - name: Commit & Push gh-pages with a new chart
+      - name: Install yq
         run: |
-          cd helm-repository/
-          git config user.name github-actions
-          git config user.email github-actions@github.com
-          git add .
-          git commit -m "${GITHUB_REF##*/} release"
-          git push origin gh-pages
+          sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Read chart metadata
+        working-directory: ${{ env.CHART_PATH }}
+        run: |
+          CHART_NAME=$(yq eval '.name' Chart.yaml)
+          CHART_VERSION=$(yq eval '.version' Chart.yaml)
+          echo "CHART_NAME=$CHART_NAME" >> $GITHUB_ENV
+          echo "CHART_VERSION=$CHART_VERSION" >> $GITHUB_ENV
+          echo "Chart: ${CHART_NAME}, Version: ${CHART_VERSION}"
+
+      - name: Helm dependencies update
+        working-directory: ${{ env.CHART_PATH }}
+        run: helm dependency update
+
+      - name: Package helm chart
+        working-directory: ${{ env.CHART_PATH }}
+        run: |
+          helm package . --destination .
+          echo "PACKAGE_FILE=${CHART_NAME}-${CHART_VERSION}.tgz" >> $GITHUB_ENV
+
+      - name: Login to Harbor OCI registry
+        run: |
+          echo "$HARBOR_TOKEN" | helm registry login "$HARBOR_REGISTRY" --username "$HARBOR_USER" --password-stdin
+
+      - name: Push chart to Harbor
+        working-directory: ${{ env.CHART_PATH }}
+        run: |
+          helm push "${PACKAGE_FILE}" "oci://${HARBOR_REGISTRY}/${HARBOR_PROJECT}"
